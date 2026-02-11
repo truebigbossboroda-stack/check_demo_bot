@@ -52,5 +52,19 @@ services:
     depends_on:
       - kafka
 
+  migrator:
+    image: python:3.11-slim
+    working_dir: /app
+    volumes:
+      - .:/app
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@pg:5432/bot_game_test
+    depends_on:
+      pg:
+        condition: service_healthy
+    command: bash -lc "pip install --no-cache-dir -r requirements.txt && alembic upgrade head"
+
+
 volumes:
   bot_game_pgdata:
+
