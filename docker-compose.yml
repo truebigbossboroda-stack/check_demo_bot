@@ -1,17 +1,32 @@
+name: bot_game
+
 services:
+  pg:
+    image: postgres:16
+    container_name: bot_game_pg
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: bot_game_test
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d bot_game_test"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - bot_game_pgdata:/var/lib/postgresql/data
+
   kafka:
     image: apache/kafka:3.7.0
     container_name: bot_game_kafka
     ports:
       - "19092:9092"
     environment:
-      # KRaft combined mode (broker+controller)
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
 
-      # Two listeners:
-      # - PLAINTEXT for docker-network clients (kafka-ui uses kafka:19092)
-      # - PLAINTEXT_HOST for host machine clients (your python publisher uses localhost:9092)
       KAFKA_LISTENERS: "PLAINTEXT://:19092,PLAINTEXT_HOST://:9092,CONTROLLER://:9093"
       KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:19092,PLAINTEXT_HOST://localhost:19092"
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
@@ -20,13 +35,10 @@ services:
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT"
       KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
 
-      # single-node required factors
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-
-      # convenience
       KAFKA_NUM_PARTITIONS: 3
 
   kafka-ui:
@@ -39,3 +51,6 @@ services:
       - KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS=kafka:19092
     depends_on:
       - kafka
+
+volumes:
+  bot_game_pgdata:
