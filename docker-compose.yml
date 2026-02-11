@@ -64,6 +64,39 @@ services:
         condition: service_healthy
     command: bash -lc "pip install --no-cache-dir -r requirements.txt && alembic upgrade head"
 
+  relay:
+    image: python:3.11-slim
+    working_dir: /app
+    volumes:
+      - .:/app
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@pg:5432/bot_game_test
+      KAFKA_BOOTSTRAP_SERVERS: kafka:19092
+      KAFKA_TOPIC: game-events
+      KAFKA_DLQ_TOPIC: game-events.dlq
+    depends_on:
+      pg:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+    command: bash -lc "pip install --no-cache-dir -r requirements.txt && python outbox_publisher.py"
+
+  consumer:
+    build:
+      context: .
+      dockerfile: Dockerfile.consumer
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@pg:5432/bot_game_test
+      KAFKA_BOOTSTRAP_SERVERS: kafka:19092
+      KAFKA_TOPIC: game-events
+      KAFKA_DLQ_TOPIC: game-events.dlq
+      KAFKA_CONSUMER_GROUP: game-consumer-v1
+    depends_on:
+      pg:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+    restart: unless-stopped
 
 volumes:
   bot_game_pgdata:

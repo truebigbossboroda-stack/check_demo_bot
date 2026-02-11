@@ -21,7 +21,7 @@ if not DATABASE_URL:
 
 BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:19092")
 TOPIC = os.getenv("KAFKA_TOPIC", "game-events")
-GROUP_ID = os.getenv("KAFKA_CONSUMER_GROUP", "game-consumer-v1")
+GROUP_ID = os.getenv("KAFKA_CONSUMER_GROUP") or os.getenv("KAFKA_GROUP_ID") or "game-consumer-v1"
 DLQ_TOPIC = os.getenv("KAFKA_DLQ_TOPIC", f"{TOPIC}.dlq")
 MAX_ATTEMPTS = int(os.getenv("KAFKA_MAX_ATTEMPTS", "5"))          # сколько раз пробуем обработать сообщение
 BASE_BACKOFF_SEC = float(os.getenv("KAFKA_BACKOFF_SEC", "0.5"))   # базовая задержка
@@ -125,10 +125,10 @@ def recompute_read_model(db, *, game_id: str):
         {"game_id": game_id},
     )
 
-def publish_dlq(dlq, *, topic: str, record, msg: dict | None, err: Exception, attempt: int):
-    # record может быть None если ошибка до получения record (редко)
+def publish_dlq(dlq, *, topic: str, record, msg: dict | None, err: Exception, attempt: int, reason: str):
     payload = {
         "dlq_version": 1,
+        "reason": reason,
         "failed_at": utc_now_iso(),
         "attempt": attempt,
         "error_type": type(err).__name__,
@@ -141,15 +141,10 @@ def publish_dlq(dlq, *, topic: str, record, msg: dict | None, err: Exception, at
             "timestamp": getattr(record, "timestamp", None),
             "key": (record.key.decode("utf-8", errors="ignore") if getattr(record, "key", None) else None),
         },
-        "message": msg,
+        "message": msg,   # если удалось распарсить в dict — можно передать сюда, иначе None
     }
-    # key для DLQ можно держать по aggregate_id/chat_id если есть
-    agg_id = None
-    if isinstance(msg, dict):
-        agg = msg.get("aggregate") or {}
-        agg_id = agg.get("id")
 
-    dlq.send(topic, key=(agg_id or None), value=payload)
+    dlq.send(topic, key=(payload["src"]["key"] or None), value=payload)
     dlq.flush(timeout=10)
 
 def main():
@@ -183,112 +178,126 @@ def main():
     err_cnt = 0
     last_metrics = time.time()
 
-    while not STOP:
-        any_msg = True
-        for record in consumer:
-            any_msg = True
-            msg = record.value
-            if msg is None:
-                skipped += 1
-                consumer.commit()
-                continue
+    try:
+        while not STOP:
+            any_msg = False
+            for record in consumer:
+                any_msg = True
+                msg = record.value
+                if msg is None:
+                    skipped += 1
+                    consumer.commit()
+                    continue
 
-            event_type = msg.get("type")
-            if event_type not in MATERIALIZE_TYPES:
-                skipped += 1
-                consumer.commit()
-                continue
+                event_type = msg.get("type")
+                if event_type not in MATERIALIZE_TYPES:
+                    skipped += 1
+                    consumer.commit()
+                    continue
 
-            event_id = msg.get("event_id")
-            aggregate = msg.get("aggregate") or {}
-            aggregate_id = aggregate.get("id")
+                event_id = msg.get("event_id")
+                aggregate = msg.get("aggregate") or {}
+                aggregate_id = aggregate.get("id")
 
-            if not event_id or not aggregate_id:
-                skipped += 1
-                consumer.commit()
-                continue
+                if not event_id or not aggregate_id:
+                    skipped += 1
+                    consumer.commit()
+                    continue
 
-            # retry loop
-            handled = False
-            for attempt in range(1, MAX_ATTEMPTS + 1):
+                # retry loop
+                handled = False
+                for attempt in range(1, MAX_ATTEMPTS + 1):
+                    try:
+                        with SessionLocal() as db:
+                            with db.begin():
+                                if already_consumed(db, event_id):
+                                    dedup += 1
+                                else:
+                                    recompute_read_model(db, game_id=aggregate_id)
+                                
+                                    mark_consumed(
+                                        db,
+                                        event_id=event_id,
+                                        topic=record.topic,
+                                        partition=record.partition,
+                                        offset=record.offset,
+                                        aggregate_type=aggregate.get("type"),
+                                        aggregate_id=aggregate_id,
+                                        event_type=event_type,
+                                    )
+                                    ok += 1
+
+                        # DB commit прошёл -> коммитим offset в Kafka
+                        consumer.commit()
+                        handled = True
+                        break
+
+                    except Exception as e:
+                        err_cnt += 1
+                        # backoff (0.5, 1, 2, 4, ...)
+                        if attempt < MAX_ATTEMPTS:
+                            time.sleep(BASE_BACKOFF_SEC * (2 ** (attempt - 1)))
+                            continue
+
+                        # poison-message: в DLQ + помечаем consumed + commit offset
+                        publish_dlq(dlq, topic=DLQ_TOPIC, record=record, msg=msg, err=e, attempt=attempt)
+
+                        with SessionLocal() as db:
+                            with db.begin():
+                                # важно: чтобы не блокировать consumer навсегда на одном сообщении
+                                if not already_consumed(db, event_id):
+                                    mark_consumed(
+                                        db,
+                                        event_id=event_id,
+                                        topic=record.topic,
+                                        partition=record.partition,
+                                        offset=record.offset,
+                                        aggregate_type=aggregate.get("type"),
+                                        aggregate_id=aggregate_id,
+                                        event_type=f"DLQ:{event_type}",
+                                    )
+                        consumer.commit()
+                        dlq_cnt += 1
+                        handled = True
+                        break
+
+                # safety
+                if not handled:
+                    # теоретически не должен сюда попасть
+                    consumer.commit()
+            now = time.time()
+
+            if now - last_metrics >= METRICS_EVERY_SEC:
+                print(f"[metrics] ok={ok} dedup={dedup} skipped={skipped} dlq={dlq_cnt} errors={err_cnt}")
+                last_metrics = now
+
+            try:
+                dlq.flush(timeout=10)
+            finally:
                 try:
-                    with SessionLocal() as db:
-                        with db.begin():
-                            if already_consumed(db, event_id):
-                                dedup += 1
-                            else:
-                                recompute_read_model(db, game_id=aggregate_id)
-                            
-                                mark_consumed(
-                                    db,
-                                    event_id=event_id,
-                                    topic=record.topic,
-                                    partition=record.partition,
-                                    offset=record.offset,
-                                    aggregate_type=aggregate.get("type"),
-                                    aggregate_id=aggregate_id,
-                                    event_type=event_type,
-                                )
-                                ok += 1
+                    dlq.close(timeout=10)
+                except Exception:
+                    pass
+                try:
+                    consumer.close()
+                except Exception:
+                    pass
 
-                    # DB commit прошёл -> коммитим offset в Kafka
-                    consumer.commit()
-                    handled = True
-                    break
-
-                except Exception as e:
-                    err_cnt += 1
-                    # backoff (0.5, 1, 2, 4, ...)
-                    if attempt < MAX_ATTEMPTS:
-                        time.sleep(BASE_BACKOFF_SEC * (2 ** (attempt - 1)))
-                        continue
-
-                    # poison-message: в DLQ + помечаем consumed + commit offset
-                    publish_dlq(dlq, topic=DLQ_TOPIC, record=record, msg=msg, err=e, attempt=attempt)
-
-                    with SessionLocal() as db:
-                        with db.begin():
-                            # важно: чтобы не блокировать consumer навсегда на одном сообщении
-                            if not already_consumed(db, event_id):
-                                mark_consumed(
-                                    db,
-                                    event_id=event_id,
-                                    topic=record.topic,
-                                    partition=record.partition,
-                                    offset=record.offset,
-                                    aggregate_type=aggregate.get("type"),
-                                    aggregate_id=aggregate_id,
-                                    event_type=f"DLQ:{event_type}",
-                                )
-                    consumer.commit()
-                    dlq_cnt += 1
-                    handled = True
-                    break
-
-            # safety
-            if not handled:
-                # теоретически не должен сюда попасть
-                consumer.commit()
-        now = time.time()
-
-        if now - last_metrics >= METRICS_EVERY_SEC:
-            print(f"[metrics] ok={ok} dedup={dedup} skipped={skipped} dlq={dlq_cnt} errors={err_cnt}")
-            last_metrics = now
-
+            if not any_msg:
+                time.sleep(0.2)
+    finally:
         try:
             dlq.flush(timeout=10)
-        finally:
-            try:
-                dlq.close(timeout=10)
-            except Exception:
-                pass
-            try:
-                consumer.close()
-            except Exception:
-                pass
-
-        if not any_msg:
-            time.sleep(0.2)
+        except Exception:
+            pass
+        try:
+            dlq.close(timeout=10)
+        except Exception:
+            pass
+        try:
+            consumer.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
