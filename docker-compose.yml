@@ -1,4 +1,4 @@
-name: bot_game
+﻿name: bot_game
 
 services:
   pg:
@@ -90,7 +90,7 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: kafka:19092
       KAFKA_TOPIC: game-events
       KAFKA_DLQ_TOPIC: game-events.dlq
-      KAFKA_CONSUMER_GROUP: game-consumer-v1
+      KAFKA_CONSUMER_GROUP: ${KAFKA_CONSUMER_GROUP:-game-consumer-v1}
     depends_on:
       pg:
         condition: service_healthy
@@ -100,3 +100,4 @@ services:
 
 volumes:
   bot_game_pgdata:
+
