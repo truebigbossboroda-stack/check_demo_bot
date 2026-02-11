@@ -9,6 +9,7 @@ from typing import Sequence, Union
 from sqlalchemy.dialects import postgresql
 from alembic import op
 import sqlalchemy as sa
+from sqlalchemy import inspect
 
 
 # revision identifiers, used by Alembic.
@@ -19,25 +20,34 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade():
+    bind = op.get_bind()
+    insp = inspect(bind)
+
+    # Если таблица уже создана более ранней миграцией — просто пропускаем.
+    if "game_state_snapshots" in insp.get_table_names(schema="public"):
+        return
+
     op.create_table(
         "game_state_snapshots",
-        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True, server_default=sa.text("gen_random_uuid()")),
-        sa.Column("game_id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("id", sa.dialects.postgresql.UUID(as_uuid=True), server_default=sa.text("gen_random_uuid()"), nullable=False),
+        sa.Column("game_id", sa.dialects.postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("chat_id", sa.BigInteger(), nullable=False),
         sa.Column("phase_seq", sa.Integer(), nullable=False),
         sa.Column("round_num", sa.Integer(), nullable=False),
-        sa.Column("snapshot", postgresql.JSONB(astext_type=sa.Text()), nullable=False, server_default=sa.text("'{}'::jsonb")),
-        sa.Column("created_at", sa.TIMESTAMP(timezone=True), nullable=False, server_default=sa.text("now()")),
+        sa.Column("snapshot", sa.dialects.postgresql.JSONB(astext_type=sa.Text()), server_default=sa.text("'{}'::jsonb"), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
+        sa.PrimaryKeyConstraint("id"),
         sa.ForeignKeyConstraint(["game_id"], ["game_sessions.id"], ondelete="CASCADE"),
         sa.CheckConstraint("phase_seq >= 0", name="ck_snapshots_phase_seq_ge_0"),
         sa.CheckConstraint("round_num >= 0", name="ck_snapshots_round_ge_0"),
     )
 
-    op.create_index("ix_snapshots_game_created", "game_state_snapshots", ["game_id", "created_at"])
-    op.create_index("ix_snapshots_chat_created", "game_state_snapshots", ["chat_id", "created_at"])
-
 
 def downgrade():
-    op.drop_index("ix_snapshots_chat_created", table_name="game_state_snapshots")
-    op.drop_index("ix_snapshots_game_created", table_name="game_state_snapshots")
+    bind = op.get_bind()
+    insp = inspect(bind)
+
+    if "game_state_snapshots" not in insp.get_table_names(schema="public"):
+        return
+
     op.drop_table("game_state_snapshots")
