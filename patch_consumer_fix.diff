@@ -1,59 +1,587 @@
-diff --git a/consumer.py b/consumer.py
 --- a/consumer.py
 +++ b/consumer.py
-@@ -67,8 +67,8 @@
-         "topic": topic,
-         "partition": partition,
-         "kafka_offset": offset,
--        "aggregate_type": agg_type,
--        "aggregate_id": agg_id,
+@@ -1,295 +1,341 @@
++import json
+ import os
+-import json
++import signal
+ import time
+ import traceback
+-import signal
+-import sys
+-from datetime import datetime, timezone
+-
+-from dotenv import load_dotenv
++import uuid
++
+ from kafka import KafkaConsumer, KafkaProducer
+-from sqlalchemy import create_engine
++from sqlalchemy import create_engine, text as sql_text
+ from sqlalchemy.orm import sessionmaker
+-from sqlalchemy import text as sql_text
+-
+-
+-load_dotenv()
+-
+-DATABASE_URL = os.getenv("DATABASE_URL")
+-if not DATABASE_URL:
+-    raise RuntimeError("DATABASE_URL missing")
+-
+-BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:19092")
++
++# ---------------------------
++# Config (env)
++# ---------------------------
++DATABASE_URL = os.getenv(
++    "DATABASE_URL",
++    "postgresql://postgres:postgres@localhost:5432/bot_game_test",
++)
++KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:19092")
+ TOPIC = os.getenv("KAFKA_TOPIC", "game-events")
++DLQ_TOPIC = os.getenv("KAFKA_DLQ_TOPIC", "game-events.dlq")
+ GROUP_ID = os.getenv("KAFKA_CONSUMER_GROUP", "game-consumer-v1")
+-DLQ_TOPIC = os.getenv("KAFKA_DLQ_TOPIC", f"{TOPIC}.dlq")
+-MAX_ATTEMPTS = int(os.getenv("KAFKA_MAX_ATTEMPTS", "5"))          # сколько раз пробуем обработать сообщение
+-BASE_BACKOFF_SEC = float(os.getenv("KAFKA_BACKOFF_SEC", "0.5"))   # базовая задержка
+-METRICS_EVERY_SEC = float(os.getenv("KAFKA_METRICS_EVERY_SEC", "10"))
+-
+-MATERIALIZE_TYPES = {
+-    "game.created",
+-    "player.joined",
+-    "phase.changed",
+-    "round.started",
+-    "round.resolved",
+-    "game.finished",
+-    "game.archived",
+-    "snapshot.created",
+-}
+-
+-engine = create_engine(DATABASE_URL, future=True, pool_pre_ping=True)
+-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+-
+-
+-def utc_now_iso() -> str:
+-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+-
+-
+-def ensure_payload_dict(msg: dict) -> dict:
+-    payload = msg.get("payload") or {}
+-    if isinstance(payload, str):
+-        payload = json.loads(payload)
+-    return payload
+-
+-
+-def mark_consumed(db, *, event_id, topic: str, partition: int, offset: int, aggregate_type, aggregate_id, event_type):
+-    db.execute(
+-        sql_text("""
+-            INSERT INTO consumed_events (id, event_id, topic, "partition", "offset", aggregate_type, aggregate_id, event_type)
+-            VALUES (gen_random_uuid(), CAST(:event_id AS uuid), :topic, :partition, :offset, :aggregate_type, CAST(:aggregate_id AS uuid), :event_type)
+-            ON CONFLICT (event_id) DO NOTHING
+-        """),
+-        {
+-            "event_id": event_id,
+-            "topic": topic,
+-            "partition": partition,
+-            "offset": offset,
+-            "aggregate_type": aggregate_type,
+-            "aggregate_id": aggregate_id,
+-            "event_type": event_type,
+-        },
+-    )
+-
+-def already_consumed(db, event_id) -> bool:
+-    r = db.execute(
++MAX_ATTEMPTS = int(os.getenv("MAX_ATTEMPTS", "10"))
++IDLE_SLEEP_SEC = float(os.getenv("IDLE_SLEEP_SEC", "0.2"))
++
++STOP = False
++
++
++def _on_signal(sig, _frame):
++    global STOP
++    STOP = True
++    print(f"[consumer] got signal {sig}, shutting down...", flush=True)
++
++
++signal.signal(signal.SIGINT, _on_signal)
++signal.signal(signal.SIGTERM, _on_signal)
++
++
++def safe_json_deserializer(b: bytes | None):
++    """Return dict or None (never raise)."""
++    if not b:
++        return None
++    try:
++        return json.loads(b.decode("utf-8"))
++    except Exception:
++        return None
++
++
++def _as_str_key(key):
++    if key is None:
++        return None
++    if isinstance(key, bytes):
++        return key.decode("utf-8", errors="ignore")
++    return str(key)
++
++
++def is_valid_uuid(value) -> bool:
++    try:
++        uuid.UUID(str(value))
++        return True
++    except Exception:
++        return False
++
++
++def already_consumed(db, *, event_id: str) -> bool:
++    # event_id is UUID in schema
++    res = db.execute(
+         sql_text("SELECT 1 FROM consumed_events WHERE event_id = CAST(:event_id AS uuid)"),
+         {"event_id": event_id},
+     ).first()
+-    return r is not None
+-
+-STOP = False
+-
+-def _handle_stop(signum, frame):
+-    global STOP
+-    STOP = True
+-
+-# !!! ВАЖНО: это заглушка materialization.
+-# Замени на реальный UPSERT под твою game_read_model.
+-def upsert_read_model_stub(db, *, chat_id: int | None, game_id: str, msg: dict):
+-    # Требует, чтобы в game_read_model была колонка state_json jsonb и уникальность по game_id.
+-    # Если у тебя другое — пришли DDL, я перепишу.
++    return res is not None
++
++
++def mark_consumed(
++    db,
++    *,
++    event_id: str,
++    topic: str,
++    partition: int,
++    offset: int,
++    aggregate_type: str | None,
++    aggregate_id: str,
++    event_type: str,
++):
++    """Idempotent write: one row per event_id.
++
++    Works with both schemas:
++      - consumed_events(kafka_offset)
++      - consumed_events("offset")  (legacy)
++    """
++
++    params = {
++        "event_id": event_id,
++        "topic": topic,
++        "partition": partition,
++        "kafka_offset": offset,
++        "offset": offset,
 +        "aggregate_type": aggregate_type,
 +        "aggregate_id": aggregate_id,
-         "event_type": event_type,
-         "consumed_at": dt.datetime.now(dt.timezone.utc),
++        "event_type": event_type,
++    }
++
++    # Prefer the new column name.
++    try:
++        db.execute(
++            sql_text(
++                """
++                INSERT INTO consumed_events
++                  (event_id, topic, \"partition\", kafka_offset, aggregate_type, aggregate_id, event_type, consumed_at)
++                VALUES
++                  (CAST(:event_id AS uuid), :topic, :partition, :kafka_offset, :aggregate_type, CAST(:aggregate_id AS uuid), :event_type, now())
++                ON CONFLICT (event_id) DO NOTHING
++                """
++            ),
++            params,
++        )
++        return
++    except Exception as e:
++        # Fallback to legacy column name "offset" if needed.
++        if "kafka_offset" not in str(e) and "does not exist" not in str(e):
++            # Not a schema mismatch → re-raise.
++            raise
++
+     db.execute(
+-        sql_text("""
+-            INSERT INTO game_read_model (game_id, chat_id, state_json, updated_at)
+-            VALUES (CAST(:game_id AS uuid), :chat_id, CAST(:state AS jsonb), now())
+-            ON CONFLICT (game_id) DO UPDATE
+-              SET chat_id = EXCLUDED.chat_id,
+-                  state_json = EXCLUDED.state_json,
+-                  updated_at = now()
+-        """),
+-        {
+-            "game_id": game_id,
+-            "chat_id": chat_id,
+-            "state": json.dumps(msg, ensure_ascii=False),
+-        },
++        sql_text(
++            """
++            INSERT INTO consumed_events
++              (event_id, topic, \"partition\", \"offset\", aggregate_type, aggregate_id, event_type, consumed_at)
++            VALUES
++              (CAST(:event_id AS uuid), :topic, :partition, :offset, :aggregate_type, CAST(:aggregate_id AS uuid), :event_type, now())
++            ON CONFLICT (event_id) DO NOTHING
++            """
++        ),
++        params,
+     )
+ 
+ 
+-def safe_json_deserializer(b: bytes):
+-    # Kafka может прислать tombstone (value=None) или пустой payload
+-    if b is None:
+-        return None
+-    s = b.decode("utf-8", errors="ignore").strip()
+-    if not s:
+-        return None
+-    try:
+-        return json.loads(s)
+-    except json.JSONDecodeError:
+-        # мусор/не-json => игнорируем
+-        return None
+-
+ def recompute_read_model(db, *, game_id: str):
+-    db.execute(
+-        sql_text("SELECT recompute_game_read_model(CAST(:game_id AS uuid))"),
+-        {"game_id": game_id},
+-    )
+-
+-def publish_dlq(dlq, *, topic: str, record, msg: dict | None, err: Exception, attempt: int):
+-    # record может быть None если ошибка до получения record (редко)
++    """Materialize read-model for the game. If the function is absent, degrade gracefully."""
++    try:
++        db.execute(sql_text("SELECT recompute_game_read_model(CAST(:game_id AS uuid))"), {"game_id": game_id})
++    except Exception as e:
++        # In demo mode we don't want to crash if the function isn't present.
++        msg = str(e)
++        if "recompute_game_read_model" in msg and "does not exist" in msg:
++            print("[consumer] WARN: recompute_game_read_model() отсутствует — пропускаю материализацию", flush=True)
++            return
++        raise
++
++
++def publish_dlq(
++    dlq: KafkaProducer,
++    *,
++    topic: str,
++    record,
++    msg: dict,
++    err: Exception,
++    attempt: int,
++    reason: str = "processing_error",
++):
+     payload = {
+-        "dlq_version": 1,
+-        "failed_at": utc_now_iso(),
++        "reason": reason,
+         "attempt": attempt,
+-        "error_type": type(err).__name__,
+-        "error": str(err),
+-        "traceback": traceback.format_exc(limit=20),
++        "error": repr(err),
++        "traceback": traceback.format_exc(),
++        "original": msg,
+         "src": {
+             "topic": getattr(record, "topic", None),
+             "partition": getattr(record, "partition", None),
+             "offset": getattr(record, "offset", None),
+-            "timestamp": getattr(record, "timestamp", None),
+-            "key": (record.key.decode("utf-8", errors="ignore") if getattr(record, "key", None) else None),
++            "key": _as_str_key(getattr(record, "key", None)),
+         },
+-        "message": msg,
      }
-@@ -242,7 +242,21 @@ def main():
-                     continue
+-    # key для DLQ можно держать по aggregate_id/chat_id если есть
+-    agg_id = None
+-    if isinstance(msg, dict):
+-        agg = msg.get("aggregate") or {}
+-        agg_id = agg.get("id")
+-
+-    dlq.send(topic, key=(agg_id or None), value=payload)
+-    dlq.flush(timeout=10)
++
++    # Key must be str for our serializer.
++    dlq_key = payload["src"]["key"]
++    dlq.send(topic, key=dlq_key, value=payload)
++    dlq.flush(5)
++
++
++def _sleep_backoff(attempt: int):
++    # bounded exponential backoff: 0.2, 0.4, 0.8, 1.6, 2.0, 2.0...
++    time.sleep(min(0.2 * (2 ** max(0, attempt - 1)), 2.0))
++
  
-                 # max attempts exceeded -> DLQ + mark consumed to avoid poison loops
--                publish_dlq(dlq, topic=DLQ_TOPIC, record=record, msg=msg, err=e, attempt=attempt)
-+                try:
-+                    publish_dlq(
-+                        dlq,
-+                        topic=DLQ_TOPIC,
-+                        record=record,
-+                        msg=msg,
-+                        err=e,
-+                        attempt=attempt,
-+                        reason="handler_error",
-+                    )
-+                except Exception as dlq_err:
-+                    # DLQ не должен валить consumer. Логируем и двигаемся дальше.
-+                    metrics["errors"] += 1
-+                    print(f"[consumer] DLQ publish failed: {dlq_err}")
-                 metrics["dlq"] += 1
+ def main():
++    print(f"[consumer] bootstrap={KAFKA_BOOTSTRAP_SERVERS} topic={TOPIC} group={GROUP_ID}", flush=True)
++
++    engine = create_engine(DATABASE_URL, future=True, pool_pre_ping=True)
++    Session = sessionmaker(bind=engine, future=True)
++
+     consumer = KafkaConsumer(
+         TOPIC,
+-        bootstrap_servers=BOOTSTRAP,
++        bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+         group_id=GROUP_ID,
+-        enable_auto_commit=False,     # commit только после DB commit
++        enable_auto_commit=False,
+         auto_offset_reset="earliest",
+         value_deserializer=safe_json_deserializer,
+         key_deserializer=lambda b: b.decode("utf-8") if b else None,
+         consumer_timeout_ms=1000,
+     )
+-    
  
-                 # mark consumed so we don't reprocess poison message
-@@ -274,16 +288,12 @@ def main():
-             if any_msg:
-                 time.sleep(0.05)
+     dlq = KafkaProducer(
+-        bootstrap_servers=BOOTSTRAP,
+-        value_serializer=lambda d: json.dumps(d, ensure_ascii=False).encode("utf-8"),
+-        key_serializer=lambda s: (s.encode("utf-8") if s else None),
++        bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
++        key_serializer=lambda s: s.encode("utf-8") if s else None,
++        value_serializer=lambda v: json.dumps(v, ensure_ascii=False).encode("utf-8"),
+     )
+-       
+-    signal.signal(signal.SIGINT, _handle_stop)
+-    signal.signal(signal.SIGTERM, _handle_stop)
+-
+-    print(f"[consumer] bootstrap={BOOTSTRAP} topic={TOPIC} group={GROUP_ID}")
+-
+-    ok = 0
+-    dedup = 0
+-    skipped = 0
+-    dlq_cnt = 0
+-    err_cnt = 0
++
++    ok = dedup = skipped = dlq_cnt = errors = 0
+     last_metrics = time.time()
  
--            try:
--                dlq.flush(timeout=10)
--            finally:
+-    while not STOP:
+-        any_msg = True
+-        for record in consumer:
+-            any_msg = True
+-            msg = record.value
+-            if msg is None:
+-                skipped += 1
+-                consumer.commit()
+-                continue
+-
+-            event_type = msg.get("type")
+-            if event_type not in MATERIALIZE_TYPES:
+-                skipped += 1
+-                consumer.commit()
+-                continue
+-
+-            event_id = msg.get("event_id")
+-            aggregate = msg.get("aggregate") or {}
+-            aggregate_id = aggregate.get("id")
+-
+-            if not event_id or not aggregate_id:
+-                skipped += 1
+-                consumer.commit()
+-                continue
+-
+-            # retry loop
+-            handled = False
+-            for attempt in range(1, MAX_ATTEMPTS + 1):
 -                try:
--                    dlq.close(timeout=10)
--                except Exception:
--                    pass
--                try:
--                    consumer.close()
--                except Exception:
--                    pass
-+            # Периодически сбрасываем DLQ producer (закрытие делаем в finally ниже)
+-                    with SessionLocal() as db:
+-                        with db.begin():
+-                            if already_consumed(db, event_id):
+-                                dedup += 1
+-                            else:
+-                                recompute_read_model(db, game_id=aggregate_id)
+-                            
++    try:
++        while not STOP:
++            any_msg = False
++
 +            try:
-+                dlq.flush(timeout=1)
-+            except Exception:
-+                pass
++                for record in consumer:
++                    any_msg = True
++                    if STOP:
++                        break
++
++                    msg = record.value
++                    if msg is None:
++                        skipped += 1
++                        consumer.commit()
++                        continue
++
++                    event_id = msg.get("event_id")
++                    event_type = msg.get("type") or msg.get("event_type") or "unknown"
++                    aggregate = msg.get("aggregate") or {}
++                    agg_type = aggregate.get("type")
++                    agg_id = aggregate.get("id")
++
++                    # Basic validation to avoid hard crashes on malformed messages.
++                    if not is_valid_uuid(event_id) or not is_valid_uuid(agg_id):
++                        skipped += 1
++                        consumer.commit()
++                        continue
++
++                    attempt = 0
++                    handled = False
++
++                    while not handled and attempt < MAX_ATTEMPTS and not STOP:
++                        try:
++                            with Session.begin() as db:
++                                if already_consumed(db, event_id=event_id):
++                                    dedup += 1
++                                    handled = True
++                                    break
++
++                                # demo: materialize by aggregate id (game id)
++                                recompute_read_model(db, game_id=agg_id)
++
+                                 mark_consumed(
+                                     db,
+                                     event_id=event_id,
+                                     topic=record.topic,
+                                     partition=record.partition,
+                                     offset=record.offset,
+-                                    aggregate_type=aggregate.get("type"),
+-                                    aggregate_id=aggregate_id,
++                                    aggregate_type=agg_type,
++                                    aggregate_id=agg_id,
+                                     event_type=event_type,
+                                 )
+-                                ok += 1
+-
+-                    # DB commit прошёл -> коммитим offset в Kafka
++
++                            ok += 1
++                            handled = True
++
++                        except Exception as e:
++                            attempt += 1
++                            if attempt < MAX_ATTEMPTS:
++                                _sleep_backoff(attempt)
++                                continue
++
++                            # Give up → DLQ + mark consumed to avoid infinite reprocessing in demo.
++                            errors += 1
++                            try:
++                                publish_dlq(
++                                    dlq,
++                                    topic=DLQ_TOPIC,
++                                    record=record,
++                                    msg=msg,
++                                    err=e,
++                                    attempt=attempt,
++                                    reason="processing_error",
++                                )
++                                dlq_cnt += 1
++                            except Exception as dlq_e:
++                                print(f"[consumer] ERROR: failed to publish DLQ: {dlq_e!r}", flush=True)
++
++                            try:
++                                with Session.begin() as db:
++                                    mark_consumed(
++                                        db,
++                                        event_id=event_id,
++                                        topic=record.topic,
++                                        partition=record.partition,
++                                        offset=record.offset,
++                                        aggregate_type=agg_type,
++                                        aggregate_id=agg_id,
++                                        event_type=f"DLQ:{event_type}",
++                                    )
++                            except Exception as db_e:
++                                print(f"[consumer] ERROR: failed to mark_consumed after DLQ: {db_e!r}", flush=True)
++
++                            handled = True
++
+                     consumer.commit()
+-                    handled = True
+-                    break
+-
+-                except Exception as e:
+-                    err_cnt += 1
+-                    # backoff (0.5, 1, 2, 4, ...)
+-                    if attempt < MAX_ATTEMPTS:
+-                        time.sleep(BASE_BACKOFF_SEC * (2 ** (attempt - 1)))
+-                        continue
+-
+-                    # poison-message: в DLQ + помечаем consumed + commit offset
+-                    publish_dlq(dlq, topic=DLQ_TOPIC, record=record, msg=msg, err=e, attempt=attempt)
+-
+-                    with SessionLocal() as db:
+-                        with db.begin():
+-                            # важно: чтобы не блокировать consumer навсегда на одном сообщении
+-                            if not already_consumed(db, event_id):
+-                                mark_consumed(
+-                                    db,
+-                                    event_id=event_id,
+-                                    topic=record.topic,
+-                                    partition=record.partition,
+-                                    offset=record.offset,
+-                                    aggregate_type=aggregate.get("type"),
+-                                    aggregate_id=aggregate_id,
+-                                    event_type=f"DLQ:{event_type}",
+-                                )
+-                    consumer.commit()
+-                    dlq_cnt += 1
+-                    handled = True
+-                    break
+-
+-            # safety
+-            if not handled:
+-                # теоретически не должен сюда попасть
+-                consumer.commit()
+-        now = time.time()
+-
+-        if now - last_metrics >= METRICS_EVERY_SEC:
+-            print(f"[metrics] ok={ok} dedup={dedup} skipped={skipped} dlq={dlq_cnt} errors={err_cnt}")
+-            last_metrics = now
+-
++
++            except Exception as loop_e:
++                # If kafka connection hiccups, don't crash the container.
++                print(f"[consumer] ERROR: consumer loop exception: {loop_e!r}", flush=True)
++                _sleep_backoff(3)
++
++            if not any_msg:
++                time.sleep(IDLE_SLEEP_SEC)
++
++            now = time.time()
++            if now - last_metrics >= 10:
++                print(
++                    f"[metrics] ok={ok} dedup={dedup} skipped={skipped} dlq={dlq_cnt} errors={errors}",
++                    flush=True,
++                )
++                last_metrics = now
++
++    finally:
+         try:
+-            dlq.flush(timeout=10)
+-        finally:
+-            try:
+-                dlq.close(timeout=10)
+-            except Exception:
+-                pass
+-            try:
+-                consumer.close()
+-            except Exception:
+-                pass
+-
+-        if not any_msg:
+-            time.sleep(0.2)
++            dlq.flush(5)
++        except Exception:
++            pass
++        try:
++            dlq.close(5)
++        except Exception:
++            pass
++        try:
++            consumer.close(5)
++        except Exception:
++            pass
  
-             if not any_msg:
-                 time.sleep(0.2)
+ 
+ if __name__ == "__main__":
+-    main()+    main()
