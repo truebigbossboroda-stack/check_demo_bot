@@ -1,33 +1,57 @@
 # Demo: Transactional Outbox → Kafka → Consumer (PostgreSQL)
 
-Этот репозиторий — небольшой **демо‑кейс “Transactional Outbox”**:
-1) приложение пишет событие в `outbox_events` (в одной транзакции с доменными данными),
-2) **relay** (`outbox_publisher.py`) публикует событие в **Kafka**,
-3) **consumer** (`consumer.py`) читает Kafka и фиксирует факт обработки в **PostgreSQL** (`consumed_events`) + (при желании) обновляет read‑model.
+Небольшой демонстрационный проект, который показывает **полный цикл доставки событий** по паттерну **Transactional Outbox**:
 
-Цель: чтобы работодатель мог **поднять всё одной командой** и увидеть полный цикл “DB → Kafka → DB”.
+1) приложение пишет событие в таблицу `outbox_events` **в той же транзакции**, что и доменные изменения;  
+2) **relay** (`outbox_publisher.py`) читает `outbox_events`, публикует событие в **Kafka** и помечает запись как `sent`;  
+3) **consumer** (`consumer.py`) читает Kafka и фиксирует факт обработки в **PostgreSQL** (`consumed_events`) — это база для **dedup/идемпотентности** на стороне потребителя.
+
+Цель репозитория —  **поднять демо локально** и проверить, что событие реально прошло путь **DB → Kafka → DB**.
 
 ---
 
 ## Что внутри
 
-- **PostgreSQL 16** (Docker)
-- **Apache Kafka 3.7.0** (Docker)
-- **Kafka UI** (Docker) — веб‑интерфейс на `http://localhost:8088`
-- **Alembic migrations** — создают таблицы/вьюхи, включая:
-  - `outbox_events` — очередь событий на публикацию
-  - `consumed_events` — журнал обработанных событий (dedup / exactly-once на уровне consumer)
-- **relay**: `outbox_publisher.py` — читает `outbox_events`, отправляет в Kafka и переводит запись в `sent`
-- **consumer**: `consumer.py` — читает Kafka и пишет факт обработки в `consumed_events`
+- PostgreSQL 16 (Docker)
+- Kafka (Docker) + Kafka UI (`http://localhost:8088`)
+- Alembic migrations (создают схему БД: `outbox_events`, `consumed_events`, вьюхи)
+- Relay: `outbox_publisher.py` (публикация outbox → Kafka + статусы `new/processing/sent`)
+- Consumer: `consumer.py` (чтение Kafka, dedup, DLQ)
 
 ---
 
-## Быстрый старт (Windows PowerShell)
+## Архитектура
+
+- **Outbox в БД** гарантирует, что событие не “потеряется” между доменной транзакцией и Kafka.
+- **Consumer пишет журнал обработанных сообщений** (`consumed_events`) и тем самым избегает повторной обработки при replay/перезапусках.
+
+---
+
+## Быстрый старт (рекомендуемый)
+
+В репозитории есть `smoke.ps1`, запускайте так (PowerShell):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\smoke.ps1
+```
+
+### Ожидаемый итог
+
+- шаги 0–5 помечаются как `[OK]`;
+- на шаге 6 появляется запись в `consumed_events`;
+- в конце видите метрики consumer (например: `[metrics] ok=1 ...`).
+
+Если на шаге 6 получаете `[FAIL]`, сначала смотрите логи `consumer` (см. раздел Troubleshooting).
+
+---
+
+## Ручной запуск (если хочется видеть каждый шаг)
 
 ### 0) Требования
+
 - Docker Desktop
 - PowerShell 5+ / PowerShell 7+
-- Порты свободны: **5432**, **19092**, **8088**
+- Свободные порты: **5432**, **19092**, **8088**
 
 Проверка:
 ```powershell
@@ -38,6 +62,7 @@ docker compose version
 ---
 
 ### 1) Поднять инфраструктуру (pg + kafka + kafka-ui)
+
 ```powershell
 docker compose up -d pg kafka kafka-ui
 docker compose ps
@@ -46,18 +71,19 @@ docker compose ps
 **Ожидаемый итог:**
 - `pg` = `healthy`
 - `kafka` и `kafka-ui` = `Up`
-- Kafka UI открывается: `http://localhost:8088`
+- Kafka UI доступен на `http://localhost:8088`
 
 ---
 
 ### 2) Прогнать миграции
+
 ```powershell
 docker compose run --rm migrator
 ```
 
-**Ожидаемый итог:** в логах `alembic` есть `upgrade ... -> head` и команда завершается без ошибок.
+**Ожидаемый итог:** в логах alembic идут `Running upgrade ...` до `head` и команда завершается без ошибок.
 
-Проверка таблиц:
+Проверка таблиц/вьюх:
 ```powershell
 docker compose exec -T pg psql -U postgres -d bot_game_test -c "SELECT tablename FROM pg_tables WHERE schemaname='public' ORDER BY 1;"
 docker compose exec -T pg psql -U postgres -d bot_game_test -c "SELECT table_name FROM information_schema.views WHERE table_schema='public' ORDER BY 1;"
@@ -67,29 +93,24 @@ docker compose exec -T pg psql -U postgres -d bot_game_test -c "SELECT table_nam
 
 ### 3) Запустить relay + consumer
 
-> Важно: **consumer** собирается как Docker image.  
-> Если вы меняли `consumer.py`, запускайте с `--build`, иначе можно случайно поднять старую версию.
+Если вы меняли `consumer.py`, запускайте **с пересборкой** (иначе может подняться старый образ):
 
 ```powershell
 docker compose up -d --build relay consumer
 docker compose ps
 ```
 
-**Ожидаемый итог:**
-- `relay` = `Up`
-- `consumer` = `Up`
-
-Проверка логов:
+Логи:
 ```powershell
-docker compose logs -n 50 relay
-docker compose logs -n 50 consumer
+docker compose logs -n 80 relay
+docker compose logs -n 80 consumer
 ```
 
 ---
 
-### 4) Вставить событие в outbox_events (правильный JSON без экранирования)
+### 4) Вставить событие в outbox_events
 
-Самый надёжный способ — `jsonb_build_object`, чтобы не ловить ошибки кавычек.
+JSON лучше формировать через `jsonb_build_object`, чтобы не бороться с кавычками и экранированием.
 
 ```powershell
 $sql = @"
@@ -116,20 +137,20 @@ $sql | docker compose exec -T pg psql -U postgres -d bot_game_test -v ON_ERROR_S
 
 **Ожидаемый итог:** `INSERT 0 1`
 
-Можно посмотреть последнюю запись:
+Проверить “верх” outbox:
 ```powershell
 docker compose exec -T pg psql -U postgres -d bot_game_test -c "SELECT id, status, created_at, idempotency_key FROM outbox_events ORDER BY created_at DESC LIMIT 5;"
 ```
 
 ---
 
-### 5) Убедиться, что relay перевёл событие в sent
+### 5) Убедиться, что relay пометил запись как sent
 
 ```powershell
 docker compose exec -T pg psql -U postgres -d bot_game_test -c "SELECT id, status, publish_attempts, last_error, published_at FROM outbox_events ORDER BY created_at DESC LIMIT 1;"
 ```
 
-**Ожидаемый итог:** `status = sent`, `published_at` заполнен.
+**Ожидаемый итог:** `status = sent`, `published_at` не `NULL`.
 
 ---
 
@@ -139,32 +160,13 @@ docker compose exec -T pg psql -U postgres -d bot_game_test -c "SELECT id, statu
 docker compose exec -T pg psql -U postgres -d bot_game_test -c "SELECT event_id, event_type, topic, partition, kafka_offset, consumed_at FROM consumed_events ORDER BY consumed_at DESC NULLS LAST LIMIT 10;"
 ```
 
-**Ожидаемый итог:** появляется строка(и) по `game-events` и `game.finished`.
-
----
-
-## Smoke test (одной командой)
-
-Если в репозитории есть `smoke.ps1`, можно запускать так:
-```powershell
-powershell -ExecutionPolicy Bypass -File .\smoke.ps1
-```
-
-**Ожидаемый итог:** все шаги `[OK]`, на шаге 6 появляется запись в `consumed_events`.
-
-Если smoke падает на шаге 6 и в логах есть `NameError`/`TypeError` — почти всегда это **старый образ consumer**.
-Решение:
-```powershell
-docker compose build consumer
-docker compose up -d --force-recreate consumer
-docker compose logs -n 80 consumer
-```
+**Ожидаемый итог:** появляется строка с `topic=game-events`, `event_type=game.finished`.
 
 ---
 
 ## Replay (повторное чтение Kafka)
 
-По умолчанию consumer делает dedup через `consumed_events`. Для “повторного прогона” в демо безопаснее всего **сменить consumer group**:
+Consumer делает dedup через таблицу `consumed_events`. Для повторного прогона демонстрации безопаснее всего **сменить consumer group**:
 
 ```powershell
 $env:KAFKA_CONSUMER_GROUP = "game-consumer-replay-$(Get-Date -Format 'yyyyMMddHHmmss')"
@@ -172,33 +174,41 @@ docker compose up -d --force-recreate --no-deps consumer
 docker compose logs -n 30 consumer
 ```
 
-**Ожидаемый итог:** consumer начинает читать топик “с нуля” для новой группы.
-
 ---
 
 ## Troubleshooting
 
-### 1) Ошибка JSON в INSERT
-Если видите `invalid input syntax for type json` — используйте `jsonb_build_object` (см. шаг 4) или `$sql` here‑string.
+### consumer не пишет в consumed_events
 
-### 2) consumer падает, но relay переводит outbox в sent
-Проверьте логи:
+1) Посмотреть логи:
 ```powershell
-docker compose logs -n 120 consumer
+docker compose logs -n 200 consumer
 ```
 
-Типовые причины:
-- забыли `--build` после правок в `consumer.py`
-- неверные переменные окружения (в Docker должны быть `pg:5432` и `kafka:19092`)
-
-### 3) Локальный запуск consumer.py (без Docker)
-Локально нужно явно задать env:
+2) Частая причина — изменили `consumer.py`, но не пересобрали образ:
 ```powershell
-$env:DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/bot_game_test"
-$env:KAFKA_BOOTSTRAP_SERVERS = "localhost:19092"
-python consumer.py
+docker compose up -d --build --force-recreate consumer
 ```
-В демо для работодателя рекомендую **всё через Docker**, так стабильнее.
+
+3) Важно: **внутри Docker** используются адреса `pg:5432` и `kafka:19092`.  
+Если случайно указать `localhost` внутри контейнера — соединение не будет работать.
 
 ---
 
+### Ошибка JSON при INSERT
+
+Если видите `invalid input syntax for type json`, значит сломались кавычки/экранирование.  
+Решение: используйте `jsonb_build_object` (см. шаг 4).
+
+---
+
+### Полный сброс окружения
+
+Если нужно начать “с чистого листа” (удалить volume с БД):
+
+```powershell
+docker compose down -v
+```
+
+## Статус
+Демо‑проект для демонстрации паттерна Transactional Outbox и практики Docker/Kafka/PostgreSQL.
