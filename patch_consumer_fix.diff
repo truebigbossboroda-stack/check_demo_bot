@@ -1,0 +1,59 @@
+diff --git a/consumer.py b/consumer.py
+--- a/consumer.py
++++ b/consumer.py
+@@ -67,8 +67,8 @@
+         "topic": topic,
+         "partition": partition,
+         "kafka_offset": offset,
+-        "aggregate_type": agg_type,
+-        "aggregate_id": agg_id,
++        "aggregate_type": aggregate_type,
++        "aggregate_id": aggregate_id,
+         "event_type": event_type,
+         "consumed_at": dt.datetime.now(dt.timezone.utc),
+     }
+@@ -242,7 +242,21 @@ def main():
+                     continue
+ 
+                 # max attempts exceeded -> DLQ + mark consumed to avoid poison loops
+-                publish_dlq(dlq, topic=DLQ_TOPIC, record=record, msg=msg, err=e, attempt=attempt)
++                try:
++                    publish_dlq(
++                        dlq,
++                        topic=DLQ_TOPIC,
++                        record=record,
++                        msg=msg,
++                        err=e,
++                        attempt=attempt,
++                        reason="handler_error",
++                    )
++                except Exception as dlq_err:
++                    # DLQ не должен валить consumer. Логируем и двигаемся дальше.
++                    metrics["errors"] += 1
++                    print(f"[consumer] DLQ publish failed: {dlq_err}")
+                 metrics["dlq"] += 1
+ 
+                 # mark consumed so we don't reprocess poison message
+@@ -274,16 +288,12 @@ def main():
+             if any_msg:
+                 time.sleep(0.05)
+ 
+-            try:
+-                dlq.flush(timeout=10)
+-            finally:
+-                try:
+-                    dlq.close(timeout=10)
+-                except Exception:
+-                    pass
+-                try:
+-                    consumer.close()
+-                except Exception:
+-                    pass
++            # Периодически сбрасываем DLQ producer (закрытие делаем в finally ниже)
++            try:
++                dlq.flush(timeout=1)
++            except Exception:
++                pass
+ 
+             if not any_msg:
+                 time.sleep(0.2)
