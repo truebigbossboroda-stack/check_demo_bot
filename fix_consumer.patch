@@ -1,0 +1,62 @@
+diff --git a/consumer.py b/consumer.py
+--- a/consumer.py
++++ b/consumer.py
+@@
+ def mark_consumed(
+     db,
+     *,
+     event_id,
+     topic: str,
+     partition: int,
+     offset: int,
+     aggregate_type,
+     aggregate_id,
+     event_type,
+ ):
+-    db.execute(
+-        sql_text(
+-            """
+-            INSERT INTO consumed_events (event_id, topic, "partition", kafka_offset, aggregate_type, aggregate_id, event_type, consumed_at)
+-            VALUES (CAST(:event_id AS uuid), :topic, :partition, :kafka_offset, :aggregate_type, CAST(:aggregate_id AS uuid), :event_type, now())
+-            ON CONFLICT (event_id) DO NOTHING
+-            """
+-        ),
+-        {
+-            "event_id": str(event_id),
+-            "topic": topic,
+-            "partition": partition,
+-            "kafka_offset": offset,
+-            "aggregate_type": agg_type,
+-            "aggregate_id": agg_id,
+-            "event_type": event_type,
+-        },
+-    )
++    try:
++        db.execute(
++            sql_text(
++                """
++                INSERT INTO consumed_events (event_id, topic, "partition", kafka_offset, aggregate_type, aggregate_id, event_type, consumed_at)
++                VALUES (CAST(:event_id AS uuid), :topic, :partition, :kafka_offset, :aggregate_type, CAST(:aggregate_id AS uuid), :event_type, now())
++                ON CONFLICT (event_id) DO NOTHING
++                """
++            ),
++            {
++                "event_id": str(event_id),
++                "topic": topic,
++                "partition": partition,
++                "kafka_offset": offset,
++                "aggregate_type": aggregate_type,
++                "aggregate_id": aggregate_id,
++                "event_type": event_type,
++            },
++        )
++        db.commit()
++    except Exception:
++        db.rollback()
++        raise
+@@
+-def publish_dlq(dlq, *, topic: str, record, msg: dict | None, err: Exception, attempt: int, reason: str):
++def publish_dlq(dlq, *, topic: str, record, msg: dict | None, err: Exception, attempt: int, reason: str = "unknown"):
+@@
+-    publish_dlq(dlq, topic=DLQ_TOPIC, record=record, msg=msg, err=e, attempt=attempt)
++    publish_dlq(dlq, topic=DLQ_TOPIC, record=record, msg=msg, err=e, attempt=attempt, reason=f"exception:{type(e).__name__}")
