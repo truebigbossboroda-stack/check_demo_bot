@@ -1,0 +1,24 @@
+diff --git a/consumer.py b/consumer.py
+--- a/consumer.py
++++ b/consumer.py
+@@ -67,8 +67,8 @@ def mark_consumed(
+     params = {
+         "event_id": event_id,
+         "topic": topic,
+         "partition": partition,
+         "kafka_offset": kafka_offset,
+-        "aggregate_type": agg_type,
+-        "aggregate_id": agg_id,
++        "aggregate_type": aggregate_type,
++        "aggregate_id": aggregate_id,
+         "event_type": event_type,
+     }
+@@ -242,7 +242,7 @@ def main():
+         # (б) нельзя - DLQ
+         attempt = attempts + 1
+-        publish_dlq(dlq, topic=DLQ_TOPIC, record=record, msg=msg, err=e, attempt=attempt)
++        publish_dlq(dlq, topic=DLQ_TOPIC, record=record, msg=msg, err=e, attempt=attempt, reason=type(e).__name__)
+         mark_consumed(
+             db,
+             event_id=event_id,
+             topic=topic,

@@ -54,19 +54,21 @@ def ensure_payload_dict(msg: dict) -> dict:
 
 
 def mark_consumed(db, *, event_id, topic: str, partition: int, offset: int, aggregate_type, aggregate_id, event_type):
-    db.execute(
+    res = db.execute(
         sql_text("""
-            INSERT INTO consumed_events (id, event_id, topic, "partition", "offset", aggregate_type, aggregate_id, event_type)
-            VALUES (gen_random_uuid(), CAST(:event_id AS uuid), :topic, :partition, :offset, :aggregate_type, CAST(:aggregate_id AS uuid), :event_type)
+            INSERT INTO consumed_events
+            (event_id, topic, "partition", kafka_offset, aggregate_type, aggregate_id, event_type, consumed_at)
+            VALUES
+            (:event_id, :topic, :partition, :kafka_offset, :aggregate_type, :aggregate_id, :event_type, now())
             ON CONFLICT (event_id) DO NOTHING
         """),
         {
             "event_id": event_id,
             "topic": topic,
             "partition": partition,
-            "offset": offset,
-            "aggregate_type": aggregate_type,
-            "aggregate_id": aggregate_id,
+            "kafka_offset": offset,   # ВАЖНО: ключ и колонка kafka_offset
+            "aggregate_type": agg_type,
+            "aggregate_id": agg_id,
             "event_type": event_type,
         },
     )
