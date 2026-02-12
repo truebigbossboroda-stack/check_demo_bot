@@ -1,0 +1,323 @@
+[1mdiff --git a/README.md b/README.md[m
+[1mindex 28bd751..effa020 100644[m
+[1m--- a/README.md[m
+[1m+++ b/README.md[m
+[36m@@ -1,23 +1,231 @@[m
+[31m-# Event-driven game backend demo (Outbox → Kafka)[m
+[32m+[m[32m# Demo: Transactional Outbox → Kafka → Consumer (PostgreSQL)[m
+ [m
+[31m-This repository demonstrates:[m
+[31m-- Transactional Outbox (PostgreSQL → Kafka)[m
+[31m-- Idempotent consumer (dedup by event_id) + retry/backoff + DLQ[m
+[31m-- Read-model materialization + replay/recompute[m
+[31m-- Alembic migrations and integration tests for key guarantees[m
+[32m+[m[32mЭтот репозиторий — небольшой **демо‑кейс “Transactional Outbox”**:[m
+[32m+[m[32m1) приложение пишет событие в `outbox_events` (в одной транзакции с доменными данными),[m
+[32m+[m[32m2) **relay** (`outbox_publisher.py`) публикует событие в **Kafka**,[m
+[32m+[m[32m3) **consumer** (`consumer.py`) читает Kafka и фиксирует факт обработки в **PostgreSQL** (`consumed_events`) + (при желании) обновляет read‑model.[m
+ [m
+[31m-## Quickstart[m
+[31m-1) Start infrastructure:[m
+[31m-```bash[m
+[31m-docker compose up -d[m
+[32m+[m[32mЦель: чтобы работодатель мог **поднять всё одной командой** и увидеть полный цикл “DB → Kafka → DB”.[m
+ [m
+[31m-2) Install deps:[m
+[32m+[m[32m---[m
+ [m
+[31m-python -m venv .venv[m
+[31m-# Windows:[m
+[31m-.\.venv\Scripts\Activate.ps1[m
+[31m-pip install -r requirements.txt[m
+[32m+[m[32m## Что внутри[m
+ [m
+[31m-3) Run migrations:[m
+[32m+[m[32m- **PostgreSQL 16** (Docker)[m
+[32m+[m[32m- **Apache Kafka 3.7.0** (Docker)[m
+[32m+[m[32m- **Kafka UI** (Docker) — веб‑интерфейс на `http://localhost:8088`[m
+[32m+[m[32m- **Alembic migrations** — создают таблицы/вьюхи, включая:[m
+[32m+[m[32m  - `outbox_events` — очередь событий на публикацию[m
+[32m+[m[32m  - `consumed_events` — журнал обработанных событий (dedup / exactly-once на уровне consumer)[m
+[32m+[m[32m- **relay**: `outbox_publisher.py` — читает `outbox_events`, отправляет в Kafka и переводит запись в `sent`[m
+[32m+[m[32m- **consumer**: `consumer.py` — читает Kafka и пишет факт обработки в `consumed_events`[m
+ [m
+[31m-alembic upgrade head[m
+\ No newline at end of file[m
+[32m+[m[32m---[m
+[32m+[m
+[32m+[m[32m## Быстрый старт (Windows PowerShell)[m
+[32m+[m
+[32m+[m[32m### 0) Требования[m
+[32m+[m[32m- Docker Desktop[m
+[32m+[m[32m- PowerShell 5+ / PowerShell 7+[m
+[32m+[m[32m- Порты свободны: **5432**, **19092**, **8088**[m
+[32m+[m
+[32m+[m[32mПроверка:[m
+[32m+[m[32m```powershell[m
+[32m+[m[32mdocker version[m
+[32m+[m[32mdocker compose version[m
+[32m+[m[32m```[m
+[32m+[m
+[32m+[m[32m---[m
+[32m+[m
+[32m+[m[32m### 1) Поднять инфраструктуру (pg + kafka + kafka-ui)[m
+[32m+[m[32m```powershell[m
+[32m+[m[32mdocker compose up -d pg kafka kafka-ui[m
+[32m+[m[32mdocker compose ps[m
+[32m+[m[32m```[m
+[32m+[m
+[32m+[m[32m**Ожидаемый итог:**[m
+[32m+[m[32m- `pg` = `healthy`[m
+[32m+[m[32m- `kafka` и `kafka-ui` = `Up`[m
+[32m+[m[32m- Kafka UI открывается: `http://localhost:8088`[m
+[32m+[m
+[32m+[m[32m---[m
+[32m+[m
+[32m+[m[32m### 2) Прогнать миграции[m
+[32m+[m[32m```powershell[m
+[32m+[m[32mdocker compose run --rm migrator[m
+[32m+[m[32m```[m
+[32m+[m
+[32m+[m[32m**Ожидаемый итог:** в логах `alembic` есть `upgrade ... -> head` и команда завершается без ошибок.[m
+[32m+[m
+[32m+[m[32mПроверка таблиц:[m
+[32m+[m[32m```powershell[m
+[32m+[m[32mdocker compose exec -T pg psql -U postgres -d bot_game_test -c "SELECT tablename FROM pg_tables WHERE schemaname='public' ORDER BY 1;"[m
+[32m+[m[32mdocker compose exec -T pg psql -U postgres -d bot_game_test -c "SELECT table_name FROM information_schema.views WHERE table_schema='public' ORDER BY 1;"[m
+[32m+[m[32m```[m
+[32m+[m
+[32m+[m[32m---[m
+[32m+[m
+[32m+[m[32m### 3) Запустить relay + consumer[m
+[32m+[m
+[32m+[m[32m> Важно: **consumer** собирается как Docker image.[m[41m  [m
+[32m+[m[32m> Если вы меняли `consumer.py`, запускайте с `--build`, иначе можно случайно поднять старую версию.[m
+[32m+[m
+[32m+[m[32m```powershell[m
+[32m+[m[32mdocker compose up -d --build relay consumer[m
+[32m+[m[32mdocker compose ps[m
+[32m+[m[32m```[m
+[32m+[m
+[32m+[m[32m**Ожидаемый итог:**[m
+[32m+[m[32m- `relay` = `Up`[m
+[32m+[m[32m- `consumer` = `Up`[m
+[32m+[m
+[32m+[m[32mПроверка логов:[m
+[32m+[m[32m```powershell[m
+[32m+[m[32mdocker compose logs -n 50 relay[m
+[32m+[m[32mdocker compose logs -n 50 consumer[m
+[32m+[m[32m```[m
+[32m+[m
+[32m+[m[32m---[m
+[32m+[m
+[32m+[m[32m### 4) Вставить событие в outbox_events (правильный JSON без экранирования)[m
+[32m+[m
+[32m+[m[32mСамый надёжный способ — `jsonb_build_object`, чтобы не ловить ошибки кавычек.[m
+[32m+[m
+[32m+[m[32m```powershell[m
+[32m+[m[32m$sql = @"[m
+[32m+[m[32mINSERT INTO outbox_events[m
+[32m+[m[32m(id,event_type,aggregate_type,aggregate_id,payload,created_at,publish_attempts,last_error,published_at,idempotency_key,status)[m
+[32m+[m[32mVALUES[m
+[32m+[m[32m([m
+[32m+[m[32m  gen_random_uuid(),[m
+[32m+[m[32m  'game.finished',[m
+[32m+[m[32m  'game',[m
+[32m+[m[32m  '11111111-1111-1111-1111-111111111111',[m
+[32m+[m[32m  jsonb_build_object('game_id','11111111-1111-1111-1111-111111111111','chat_id',-5056821738),[m
+[32m+[m[32m  now(),[m
+[32m+[m[32m  0,[m
+[32m+[m[32m  NULL,[m
+[32m+[m[32m  NULL,[m
+[32m+[m[32m  concat('demo-', gen_random_uuid()),[m
+[32m+[m[32m  'new'[m
+[32m+[m[32m);[m
+[32m+[m[32m"@[m
+[32m+[m
+[32m+[m[32m$sql | docker compose exec -T pg psql -U postgres -d bot_game_test -v ON_ERROR_STOP=1[m
+[32m+[m[32m```[m
+[32m+[m
+[32m+[m[32m**Ожидаемый итог:** `INSERT 0 1`[m
+[32m+[m
+[32m+[m[32mМожно посмотреть последнюю запись:[m
+[32m+[m[32m```powershell[m
+[32m+[m[32mdocker compose exec -T pg psql -U postgres -d bot_game_test -c "SELECT id, status, created_at, idempotency_key FROM outbox_events ORDER BY created_at DESC LIMIT 5;"[m
+[32m+[m[32m```[m
+[32m+[m
+[32m+[m[32m---[m
+[32m+[m
+[32m+[m[32m### 5) Убедиться, что relay перевёл событие в sent[m
+[32m+[m
+[32m+[m[32m```powershell[m
+[32m+[m[32mdocker compose exec -T pg psql -U postgres -d bot_game_test -c "SELECT id, status, publish_attempts, last_error, published_at FROM outbox_events ORDER BY created_at DESC LIMIT 1;"[m
+[32m+[m[32m```[m
+[32m+[m
+[32m+[m[32m**Ожидаемый итог:** `status = sent`, `published_at` заполнен.[m
+[32m+[m
+[32m+[m[32m---[m
+[32m+[m
+[32m+[m[32m### 6) Убедиться, что consumer записал обработку в consumed_events[m
+[32m+[m
+[32m+[m[32m```powershell[m
+[32m+[m[32mdocker compose exec -T pg psql -U postgres -d bot_game_test -c "SELECT event_id, event_type, topic, partition, kafka_offset, consumed_at FROM consumed_events ORDER BY consumed_at DESC NULLS LAST LIMIT 10;"[m
+[32m+[m[32m```[m
+[32m+[m
+[32m+[m[32m**Ожидаемый итог:** появляется строка(и) по `game-events` и `game.finished`.[m
+[32m+[m
+[32m+[m[32m---[m
+[32m+[m
+[32m+[m[32m## Smoke test (одной командой)[m
+[32m+[m
+[32m+[m[32mЕсли в репозитории есть `smoke.ps1`, можно запускать так:[m
+[32m+[m[32m```powershell[m
+[32m+[m[32mpowershell -ExecutionPolicy Bypass -File .\smoke.ps1[m
+[32m+[m[32m```[m
+[32m+[m
+[32m+[m[32m**Ожидаемый итог:** все шаги `[OK]`, на шаге 6 появляется запись в `consumed_events`.[m
+[32m+[m
+[32m+[m[32mЕсли smoke падает на шаге 6 и в логах есть `NameError`/`TypeError` — почти всегда это **старый образ consumer**.[m
+[32m+[m[32mРешение:[m
+[32m+[m[32m```powershell[m
+[32m+[m[32mdocker compose build consumer[m
+[32m+[m[32mdocker compose up -d --force-recreate consumer[m
+[32m+[m[32mdocker compose logs -n 80 consumer[m
+[32m+[m[32m```[m
+[32m+[m
+[32m+[m[32m---[m
+[32m+[m
+[32m+[m[32m## Replay (повторное чтение Kafka)[m
+[32m+[m
+[32m+[m[32mПо умолчанию consumer делает dedup через `consumed_events`. Для “повторного прогона” в демо безопаснее всего **сменить consumer group**:[m
+[32m+[m
+[32m+[m[32m```powershell[m
+[32m+[m[32m$env:KAFKA_CONSUMER_GROUP = "game-consumer-replay-$(Get-Date -Format 'yyyyMMddHHmmss')"[m
+[32m+[m[32mdocker compose up -d --force-recreate --no-deps consumer[m
+[32m+[m[32mdocker compose logs -n 30 consumer[m
+[32m+[m[32m```[m
+[32m+[m
+[32m+[m[32m**Ожидаемый итог:** consumer начинает читать топик “с нуля” для новой группы.[m
+[32m+[m
+[32m+[m[32m---[m
+[32m+[m
+[32m+[m[32m## Troubleshooting[m
+[32m+[m
+[32m+[m[32m### 1) Ошибка JSON в INSERT[m
+[32m+[m[32mЕсли видите `invalid input syntax for type json` — используйте `jsonb_build_object` (см. шаг 4) или `$sql` here‑string.[m
+[32m+[m
+[32m+[m[32m### 2) consumer падает, но relay переводит outbox в sent[m
+[32m+[m[32mПроверьте логи:[m
+[32m+[m[32m```powershell[m
+[32m+[m[32mdocker compose logs -n 120 consumer[m
+[32m+[m[32m```[m
+[32m+[m
+[32m+[m[32mТиповые причины:[m
+[32m+[m[32m- забыли `--build` после правок в `consumer.py`[m
+[32m+[m[32m- неверные переменные окружения (в Docker должны быть `pg:5432` и `kafka:19092`)[m
+[32m+[m
+[32m+[m[32m### 3) Локальный запуск consumer.py (без Docker)[m
+[32m+[m[32mЛокально нужно явно задать env:[m
+[32m+[m[32m```powershell[m
+[32m+[m[32m$env:DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/bot_game_test"[m
+[32m+[m[32m$env:KAFKA_BOOTSTRAP_SERVERS = "localhost:19092"[m
+[32m+[m[32mpython consumer.py[m
+[32m+[m[32m```[m
+[32m+[m[32mВ демо для работодателя рекомендую **всё через Docker**, так стабильнее.[m
+[32m+[m
+[32m+[m[32m---[m
+[32m+[m
+[32m+[m[32m## Как залить на GitHub (коротко)[m
+[32m+[m
+[32m+[m[32m1) Проверить, что всё работает:[m
+[32m+[m[32m```powershell[m
+[32m+[m[32mgit status[m
+[32m+[m[32mpowershell -ExecutionPolicy Bypass -File .\smoke.ps1[m
+[32m+[m[32m```[m
+[32m+[m
+[32m+[m[32m2) Добавить изменения и проверить, что именно коммитится:[m
+[32m+[m[32m```powershell[m
+[32m+[m[32mgit add .[m
+[32m+[m[32mgit diff --staged[m
+[32m+[m[32m```[m
+[32m+[m
+[32m+[m[32m3) Коммит:[m
+[32m+[m[32m```powershell[m
+[32m+[m[32mgit commit -m "docs: add runbook + smoke demo"[m
+[32m+[m[32m```[m
+[32m+[m
+[32m+[m[32m4) Пуш:[m
+[32m+[m[32m```powershell[m
+[32m+[m[32mgit remote add origin <URL_ВАШЕГО_REPO>[m
+[32m+[m[32mgit branch -M main[m
+[32m+[m[32mgit push -u origin main[m
+[32m+[m[32m```[m
+[32m+[m
+[32m+[m[32m**Ожидаемый итог:** в GitHub появляется README, docker-compose, скрипты и инструкции запуска.[m
+[1mdiff --git a/fix_consumer.patch b/fix_consumer.patch[m
+[1mnew file mode 100644[m
+[1mindex 0000000..fab71d0[m
+[1m--- /dev/null[m
+[1m+++ b/fix_consumer.patch[m
+[36m@@ -0,0 +1,62 @@[m
+[32m+[m[32mdiff --git a/consumer.py b/consumer.py[m
+[32m+[m[32m--- a/consumer.py[m
+[32m+[m[32m+++ b/consumer.py[m
+[32m+[m[32m@@[m
+[32m+[m[32m def mark_consumed([m
+[32m+[m[32m     db,[m
+[32m+[m[32m     *,[m
+[32m+[m[32m     event_id,[m
+[32m+[m[32m     topic: str,[m
+[32m+[m[32m     partition: int,[m
+[32m+[m[32m     offset: int,[m
+[32m+[m[32m     aggregate_type,[m
+[32m+[m[32m     aggregate_id,[m
+[32m+[m[32m     event_type,[m
+[32m+[m[32m ):[m
+[32m+[m[32m-    db.execute([m
+[32m+[m[32m-        sql_text([m
+[32m+[m[32m-            """[m
+[32m+[m[32m-            INSERT INTO consumed_events (event_id, topic, "partition", kafka_offset, aggregate_type, aggregate_id, event_type, consumed_at)[m
+[32m+[m[32m-            VALUES (CAST(:event_id AS uuid), :topic, :partition, :kafka_offset, :aggregate_type, CAST(:aggregate_id AS uuid), :event_type, now())[m
+[32m+[m[32m-            ON CONFLICT (event_id) DO NOTHING[m
+[32m+[m[32m-            """[m
+[32m+[m[32m-        ),[m
+[32m+[m[32m-        {[m
+[32m+[m[32m-            "event_id": str(event_id),[m
+[32m+[m[32m-            "topic": topic,[m
+[32m+[m[32m-            "partition": partition,[m
+[32m+[m[32m-            "kafka_offset": offset,[m
+[32m+[m[32m-            "aggregate_type": agg_type,[m
+[32m+[m[32m-            "aggregate_id": agg_id,[m
+[32m+[m[32m-            "event_type": event_type,[m
+[32m+[m[32m-        },[m
+[32m+[m[32m-    )[m
+[32m+[m[32m+    try:[m
+[32m+[m[32m+        db.execute([m
+[32m+[m[32m+            sql_text([m
+[32m+[m[32m+                """[m
+[32m+[m[32m+                INSERT INTO consumed_events (event_id, topic, "partition", kafka_offset, aggregate_type, aggregate_id, event_type, consumed_at)[m
+[32m+[m[32m+                VALUES (CAST(:event_id AS uuid), :topic, :partition, :kafka_offset, :aggregate_type, CAST(:aggregate_id AS uuid), :event_type, now())[m
+[32m+[m[32m+                ON CONFLICT (event_id) DO NOTHING[m
+[32m+[m[32m+                """[m
+[32m+[m[32m+            ),[m
+[32m+[m[32m+            {[m
+[32m+[m[32m+                "event_id": str(event_id),[m
+[32m+[m[32m+                "topic": topic,[m
+[32m+[m[32m+                "partition": partition,[m
+[32m+[m[32m+                "kafka_offset": offset,[m
+[32m+[m[32m+                "aggregate_type": aggregate_type,[m
+[32m+[m[32m+                "aggregate_id": aggregate_id,[m
+[32m+[m[32m+                "event_type": event_type,[m
+[32m+[m[32m+            },[m
+[32m+[m[32m+        )[m
+[32m+[m[32m+        db.commit()[m
+[32m+[m[32m+    except Exception:[m
+[32m+[m[32m+        db.rollback()[m
+[32m+[m[32m+        raise[m
+[32m+[m[32m@@[m
+[32m+[m[32m-def publish_dlq(dlq, *, topic: str, record, msg: dict | None, err: Exception, attempt: int, reason: str):[m
+[32m+[m[32m+def publish_dlq(dlq, *, topic: str, record, msg: dict | None, err: Exception, attempt: int, reason: str = "unknown"):[m
+[32m+[m[32m@@[m
+[32m+[m[32m-    publish_dlq(dlq, topic=DLQ_TOPIC, record=record, msg=msg, err=e, attempt=attempt)[m
+[32m+[m[32m+    publish_dlq(dlq, topic=DLQ_TOPIC, record=record, msg=msg, err=e, attempt=attempt, reason=f"exception:{type(e).__name__}")[m
+\ No newline at end of file[m
