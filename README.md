@@ -176,6 +176,100 @@ docker compose logs -n 30 consumer
 
 ---
 
+## Дополнительно: Telegram-игра NeMonopolia (main.py)
+
+**NeMonopolia** — Telegram-бот (backend-логика + данные), из практического проекта под который применялся outbox‑подход.  
+Игра хранит и изменяет состояние в PostgreSQL, ведёт аудит/снапшоты и эмитит доменные события в `outbox_events`, которые дальше идут по пайплайну **PostgreSQL → Outbox → Kafka → Consumer → PostgreSQL**.
+
+Что этот кейс показывает дополнительно:
+
+- доменную модель и state machine игры: фазы/раунды `lobby → income → event → world_arena → negotiations → orders → resolve → finished`;
+- контроль конкурентных изменений при апдейте состояния (row-level lock на запись игры);
+- аудит действий (кто/что/когда) + снапшоты состояния по ключевым шагам (воспроизводимость/разбор инцидентов);
+- эмиссию доменных событий через outbox (`emit_event`) с `idempotency_key` для безопасной публикации/интеграции.
+
+### Быстрый запуск игры (5–10 минут)
+
+> Перед запуском бота подними инфраструктуру и сервисы outbox: раздел **«Ручной запуск» → шаги 1–3** (pg + kafka + kafka-ui, миграции, relay + consumer).
+
+1) **Создай Telegram-бота** через BotFather и получи токен.
+
+2) **Настрой `.env`** :
+
+> ⚙️ Варианты подключений:
+> - если запускаем `python main.py` **на хосте** (рекомендуемо для демо), оставь как в `.env.example`: `DATABASE_URL=...@localhost:5432/...`, `KAFKA_BOOTSTRAP_SERVERS=localhost:19092`
+> - если запускаем бота **внутри docker compose**, поменяй на: `DATABASE_URL=...@pg:5432/...`, `KAFKA_BOOTSTRAP_SERVERS=kafka:19092`
+
+```powershell
+Copy-Item .env.example .env
+# затем добавь строку:
+# TELEGRAM_BOT_TOKEN=xxxxx
+```
+
+Linux/Mac:
+```bash
+cp .env.example .env
+# затем добавь строку:
+# TELEGRAM_BOT_TOKEN=xxxxx
+```
+
+3) **Установи зависимости**:
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+Linux/Mac:
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+4) **Запусти бота**:
+```bash
+python main.py
+```
+
+### Мини-сценарий в Telegram
+
+В чате с ботом:
+- `/start` — проверка, что бот жив
+
+В групповом чате (куда добавлен бот):
+- `/startgame` — создать игру
+- `/joingame` — игрокам вступить
+- `/ready` — подтвердить готовность на фазе
+- `/begin_round` — ведущий запускает раунд
+- `/next_phase` — переход по фазам (или `/menu` для меню)
+- `/status`, `/gameinfo` — посмотреть статус
+- `/orders`, `/rules` — меню указов/правила
+- `/endgame` — завершить игру  
+- (опционально) `/votum`, `/votum_result` — вотум недоверия
+
+### Как убедиться, что outbox работает на событиях игры
+
+- Логи:
+```bash
+docker compose logs -f relay consumer
+```
+
+- SQL‑проверки:
+```sql
+SELECT id, event_type, status, published_at, idempotency_key
+FROM outbox_events
+ORDER BY created_at DESC
+LIMIT 20;
+
+SELECT event_id, event_type, kafka_offset, created_at
+FROM consumed_events
+ORDER BY created_at DESC
+LIMIT 20;
+```
+
+- Kafka UI: открой `http://localhost:8088` → topic `game-events` → messages.
+
 ## Troubleshooting
 
 ### consumer не пишет в consumed_events
