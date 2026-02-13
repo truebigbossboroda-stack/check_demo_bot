@@ -140,7 +140,7 @@ def recompute_read_model(db, *, game_id: str):
     try:
         db.execute(sql_text("SELECT recompute_game_read_model(CAST(:game_id AS uuid))"), {"game_id": game_id})
     except Exception as e:
-        # In demo mode we don't want to crash if the function isn't present.
+        
         msg = str(e)
         if "recompute_game_read_model" in msg and "does not exist" in msg:
             print("[consumer] WARN: recompute_game_read_model() отсутствует — пропускаю материализацию", flush=True)

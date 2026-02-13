@@ -15,6 +15,7 @@ from repositories.game_repo import get_active_game_by_chat
 from repositories.game_repo import lock_game_row 
 from repositories.snapshot_repo import insert_snapshot
 from repositories.audit_repo import audit_log
+from pathlib import Path
 from sqlalchemy import text as sql_text
 from sqlalchemy.orm import Session
 from repositories.game_sessions_repo import get_current_session
@@ -38,7 +39,8 @@ from telegram.ext import (
 
 # ---------------- НАСТРОЙКИ -----------------
 
-load_dotenv() 
+env_path = Path(__file__).resolve().parent / ".env"
+load_dotenv(env_path)
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not TOKEN:
