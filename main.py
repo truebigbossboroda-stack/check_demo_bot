@@ -10,6 +10,7 @@ from typing import Dict, Optional, Set, List, Any, Tuple
 from telegram.error import Forbidden, BadRequest
 from telegram.request import HTTPXRequest
 from db import SessionLocal
+from dotenv import load_dotenv
 from repositories.game_repo import get_active_game_by_chat
 from repositories.game_repo import lock_game_row 
 from repositories.snapshot_repo import insert_snapshot
@@ -37,10 +38,13 @@ from telegram.ext import (
 
 # ---------------- НАСТРОЙКИ -----------------
 
-# СЮДА САМ ВСТАВЬ НОВЫЙ ТОКЕН ОТ BotFather
-TOKEN = "8267335637:AAFSqy0Y_NPy2SL9rkkv41B7f2z_ztFQs3E"
+load_dotenv() 
 
-EVENTS_POOL: List[dict] = []  # сюда при желании загрузишь events.json
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+if not TOKEN:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN is missing. Create .env or set env var.")
+
+EVENTS_POOL: List[dict] = [] 
 
 logging.basicConfig(level=logging.INFO)
 print(">>> Запуск бота NeMonopolia...")
@@ -430,7 +434,7 @@ def apply_orders_for_country(game: WorldState, country: Country) -> Tuple[List[s
     strikes = list(getattr(country, "planned_strikes", []))[:3]
     if strikes:
         for idx, (tid, ccode) in enumerate(strikes, start=1):
-            # Тратим ресурсы атакующего транзакционно
+            # Трата ресурсов атакующего транзакционно
             if country.nukes <= 0:
                 changes.append("☢️ Удары: закончились боеголовки.")
                 break
